@@ -31,10 +31,26 @@ from openpyxl.utils import get_column_letter
 
 CKAN_API_BASE = "https://dati.anticorruzione.it/opendata/api/3/action/"
 CIG_API_BASE = "https://api.anticorruzione.it/apicig/1.0.0/getSmartCig/"
+# URL diretto noto e stabile del dataset ANAC "cup" (file ZIP contenente il CSV)
+URL_DATASET_CUP_STATICO = (
+    "https://dati.anticorruzione.it/opendata/download/dataset/cup/filesystem/cup_csv.zip"
+)
 RICHIESTA_TIMEOUT = 30
-DOWNLOAD_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = 180
 PAUSA_TRA_RICHIESTE = 0.5
 MAX_TENTATIVI = 5
+
+# Il portale open data ANAC filtra le richieste prive di intestazioni "da browser":
+# senza uno User-Agent realistico alcune richieste vengono rifiutate (pagina di errore
+# invece di JSON/CSV). Le stesse intestazioni vengono usate anche verso l'API getSmartCig
+# per uniformità, senza effetti negativi.
+HEADERS_BROWSER = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/csv, application/zip, */*",
+}
 
 COLONNE_RISULTATO = [
     "CUP",
@@ -150,34 +166,65 @@ st.markdown(
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def risolvi_url_dataset_cup() -> str:
-    """Interroga l'API CKAN di ANAC per trovare l'URL di download aggiornato
-    del file CSV del dataset 'cup'."""
-    resp = requests.get(
-        CKAN_API_BASE + "package_show",
-        params={"id": "cup"},
-        timeout=RICHIESTA_TIMEOUT,
-    )
-    resp.raise_for_status()
-    dati = resp.json()
-    risorse = dati.get("result", {}).get("resources", [])
-    for r in risorse:
-        if r.get("format", "").upper() == "CSV" and "log" not in r.get("name", "").lower():
-            return r["url"]
-    # fallback: prima risorsa CSV disponibile
-    for r in risorse:
-        if r.get("format", "").upper() == "CSV":
-            return r["url"]
-    raise RuntimeError("Nessuna risorsa CSV trovata nel dataset 'cup' di ANAC.")
+    """Restituisce l'URL di download del file del dataset 'cup' di ANAC.
+    Prova prima a chiedere l'URL aggiornato tramite l'API CKAN; se il
+    portale rifiuta la richiesta (capita con alcune reti cloud), usa
+    l'URL statico noto come ripiego."""
+    try:
+        resp = requests.get(
+            CKAN_API_BASE + "package_show",
+            params={"id": "cup"},
+            headers=HEADERS_BROWSER,
+            timeout=RICHIESTA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        dati = resp.json()
+        risorse = dati.get("result", {}).get("resources", [])
+        for r in risorse:
+            nome = r.get("name", "").lower()
+            formato = r.get("format", "").upper()
+            if formato in ("CSV", "ZIP") and "log" not in nome:
+                return r["url"]
+        for r in risorse:
+            if r.get("format", "").upper() in ("CSV", "ZIP"):
+                return r["url"]
+    except Exception:
+        pass  # ripiego sull'URL statico
+
+    return URL_DATASET_CUP_STATICO
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def scarica_dataset_cup() -> pd.DataFrame:
-    """Scarica e carica in memoria il dataset CIG<->CUP di ANAC."""
+    """Scarica e carica in memoria il dataset CIG<->CUP di ANAC.
+    Gestisce sia file CSV diretti sia archivi ZIP contenenti il CSV."""
+    import zipfile
+
     url = risolvi_url_dataset_cup()
-    resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+    resp = requests.get(url, headers=HEADERS_BROWSER, timeout=DOWNLOAD_TIMEOUT, stream=True)
     resp.raise_for_status()
     contenuto = resp.content
-    df = pd.read_csv(io.BytesIO(contenuto), dtype=str, sep=None, engine="python")
+
+    if not contenuto:
+        raise RuntimeError("Il portale ANAC ha restituito una risposta vuota.")
+
+    # Se è uno ZIP, estraggo il primo file CSV al suo interno
+    if zipfile.is_zipfile(io.BytesIO(contenuto)):
+        with zipfile.ZipFile(io.BytesIO(contenuto)) as zf:
+            nomi_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not nomi_csv:
+                raise RuntimeError(f"Nessun file CSV trovato nello ZIP scaricato. Contenuto: {zf.namelist()}")
+            with zf.open(nomi_csv[0]) as f_csv:
+                df = pd.read_csv(f_csv, dtype=str, sep=None, engine="python")
+    else:
+        anteprima = contenuto[:100].lstrip()
+        if anteprima[:1] in (b"<", b"{"):
+            testo_anteprima = contenuto[:300].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Il portale ANAC ha restituito una pagina di errore invece del file. Anteprima: {testo_anteprima}"
+            )
+        df = pd.read_csv(io.BytesIO(contenuto), dtype=str, sep=None, engine="python")
+
     df.columns = [c.strip().upper() for c in df.columns]
     return df
 
@@ -209,7 +256,7 @@ def interroga_cig(cig: str) -> dict:
     ultimo_errore = None
     for tentativo in range(1, MAX_TENTATIVI + 1):
         try:
-            resp = requests.get(url, timeout=RICHIESTA_TIMEOUT)
+            resp = requests.get(url, headers=HEADERS_BROWSER, timeout=RICHIESTA_TIMEOUT)
             if resp.status_code >= 500:
                 ultimo_errore = f"{resp.status_code} Server Error"
                 time.sleep(min(2 ** tentativo, 20) + random.uniform(0, 1))
@@ -346,95 +393,131 @@ if cup_list:
             try:
                 df_cup_dataset = scarica_dataset_cup()
             except Exception as e:
-                st.error(
-                    f"Impossibile scaricare il dataset ANAC 'cup': {e}\n\n"
-                    "Puoi comunque scaricarlo manualmente da "
-                    "https://dati.anticorruzione.it/opendata/dataset/cup e ricaricarlo qui sotto."
-                )
+                st.session_state["errore_download_cup"] = str(e)
                 df_cup_dataset = None
-
-        if df_cup_dataset is not None:
-            corrispondenze = trova_cig_per_cup(df_cup_dataset, cup_list)
-
-            cup_trovati = set(corrispondenze["CUP"].str.upper())
-            cup_non_trovati = [c for c in cup_list if c.upper() not in cup_trovati]
-
-            if corrispondenze.empty:
-                st.warning("Nessun CIG trovato per i CUP indicati nel dataset ANAC.")
+                st.session_state["df_cup_dataset"] = None
             else:
-                st.info(
-                    f"Trovati **{len(corrispondenze)}** CIG collegati a "
-                    f"**{len(cup_trovati)}** CUP su {len(cup_list)} richiesti."
+                st.session_state["df_cup_dataset"] = df_cup_dataset
+                st.session_state["errore_download_cup"] = None
+
+    if st.session_state.get("errore_download_cup"):
+        st.error(
+            f"Impossibile scaricare automaticamente il dataset ANAC 'cup': "
+            f"{st.session_state['errore_download_cup']}"
+        )
+        st.markdown(
+            "**Soluzione alternativa**: scarica manualmente il file dal link qui sotto "
+            "e ricaricalo per proseguire."
+        )
+        st.markdown("🔗 [Apri il dataset 'cup' su dati.anticorruzione.it]"
+                    "(https://dati.anticorruzione.it/opendata/dataset/cup)")
+        file_dataset_manuale = st.file_uploader(
+            "Carica qui il file scaricato (CSV o ZIP contenente il CSV)",
+            type=["csv", "zip"],
+            key="upload_dataset_cup",
+        )
+        if file_dataset_manuale is not None:
+            import zipfile
+            contenuto = file_dataset_manuale.read()
+            try:
+                if file_dataset_manuale.name.lower().endswith(".zip") or zipfile.is_zipfile(io.BytesIO(contenuto)):
+                    with zipfile.ZipFile(io.BytesIO(contenuto)) as zf:
+                        nomi_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                        with zf.open(nomi_csv[0]) as f_csv:
+                            df_manuale = pd.read_csv(f_csv, dtype=str, sep=None, engine="python")
+                else:
+                    df_manuale = pd.read_csv(io.BytesIO(contenuto), dtype=str, sep=None, engine="python")
+                df_manuale.columns = [c.strip().upper() for c in df_manuale.columns]
+                st.session_state["df_cup_dataset"] = df_manuale
+                st.session_state["errore_download_cup"] = None
+                st.success("File caricato correttamente. Premi di nuovo 'Cerca CIG collegati' se necessario.")
+            except Exception as e2:
+                st.error(f"Impossibile leggere il file caricato: {e2}")
+
+    df_cup_dataset = st.session_state.get("df_cup_dataset")
+
+    if df_cup_dataset is not None:
+        corrispondenze = trova_cig_per_cup(df_cup_dataset, cup_list)
+
+        cup_trovati = set(corrispondenze["CUP"].str.upper())
+        cup_non_trovati = [c for c in cup_list if c.upper() not in cup_trovati]
+
+        if corrispondenze.empty:
+            st.warning("Nessun CIG trovato per i CUP indicati nel dataset ANAC.")
+        else:
+            st.info(
+                f"Trovati **{len(corrispondenze)}** CIG collegati a "
+                f"**{len(cup_trovati)}** CUP su {len(cup_list)} richiesti."
+            )
+
+            barra_avanzamento = st.progress(0, text="Recupero dettagli CIG in corso...")
+            placeholder_tabella = st.empty()
+            risultati = []
+
+            righe = corrispondenze.to_dict("records")
+            for i, riga_match in enumerate(righe, start=1):
+                cup = riga_match["CUP"]
+                cig = riga_match["CIG"]
+                risposta = interroga_cig(cig)
+                risultati.append(estrai_dati(cup, cig, risposta))
+
+                barra_avanzamento.progress(
+                    i / len(righe),
+                    text=f"CIG {i} di {len(righe)}: {cig} (CUP {cup})",
                 )
 
-                barra_avanzamento = st.progress(0, text="Recupero dettagli CIG in corso...")
-                placeholder_tabella = st.empty()
-                risultati = []
+                df_parziale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
+                placeholder_tabella.dataframe(df_parziale, use_container_width=True, height=350)
 
-                righe = corrispondenze.to_dict("records")
-                for i, riga_match in enumerate(righe, start=1):
-                    cup = riga_match["CUP"]
-                    cig = riga_match["CIG"]
-                    risposta = interroga_cig(cig)
-                    risultati.append(estrai_dati(cup, cig, risposta))
+                time.sleep(PAUSA_TRA_RICHIESTE)
 
-                    barra_avanzamento.progress(
-                        i / len(righe),
-                        text=f"CIG {i} di {len(righe)}: {cig} (CUP {cup})",
-                    )
+            barra_avanzamento.empty()
+            df_finale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
 
-                    df_parziale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
-                    placeholder_tabella.dataframe(df_parziale, use_container_width=True, height=350)
-
-                    time.sleep(PAUSA_TRA_RICHIESTE)
-
-                barra_avanzamento.empty()
-                df_finale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
-
-                st.markdown("### Riepilogo per CUP")
-                riepilogo = (
-                    df_finale.groupby("CUP")["CIG"]
-                    .nunique()
-                    .reset_index()
-                    .rename(columns={"CIG": "Numero CIG collegati"})
-                )
-                if cup_non_trovati:
-                    df_non_trovati = pd.DataFrame(
-                        {"CUP": cup_non_trovati, "Numero CIG collegati": 0}
-                    )
-                    riepilogo = pd.concat([riepilogo, df_non_trovati], ignore_index=True)
-                st.dataframe(riepilogo, use_container_width=True, height=min(400, 40 + 35 * len(riepilogo)))
-
-                st.markdown("### Dettaglio completo")
-                st.dataframe(df_finale, use_container_width=True, height=400)
-
-                excel_bytes = genera_excel_risultato(df_finale)
-                csv_bytes = df_finale.to_csv(index=False).encode("utf-8-sig")
-
-                col_dl1, col_dl2 = st.columns(2)
-                with col_dl1:
-                    st.download_button(
-                        label="Scarica risultati (Excel)",
-                        data=excel_bytes,
-                        file_name="cig_collegati_a_cup.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-                with col_dl2:
-                    st.download_button(
-                        label="Scarica risultati (CSV)",
-                        data=csv_bytes,
-                        file_name="cig_collegati_a_cup.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
+            st.markdown("### Riepilogo per CUP")
+            riepilogo = (
+                df_finale.groupby("CUP")["CIG"]
+                .nunique()
+                .reset_index()
+                .rename(columns={"CIG": "Numero CIG collegati"})
+            )
             if cup_non_trovati:
-                st.warning(
-                    "I seguenti CUP non risultano nel dataset ANAC (potrebbero riguardare "
-                    "affidamenti non ordinari, essere di recente emissione o non ancora "
-                    "propagati nel dataset open data): " + ", ".join(cup_non_trovati)
+                df_non_trovati = pd.DataFrame(
+                    {"CUP": cup_non_trovati, "Numero CIG collegati": 0}
                 )
+                riepilogo = pd.concat([riepilogo, df_non_trovati], ignore_index=True)
+            st.dataframe(riepilogo, use_container_width=True, height=min(400, 40 + 35 * len(riepilogo)))
+
+            st.markdown("### Dettaglio completo")
+            st.dataframe(df_finale, use_container_width=True, height=400)
+
+            excel_bytes = genera_excel_risultato(df_finale)
+            csv_bytes = df_finale.to_csv(index=False).encode("utf-8-sig")
+
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    label="Scarica risultati (Excel)",
+                    data=excel_bytes,
+                    file_name="cig_collegati_a_cup.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col_dl2:
+                st.download_button(
+                    label="Scarica risultati (CSV)",
+                    data=csv_bytes,
+                    file_name="cig_collegati_a_cup.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+        if cup_non_trovati:
+            st.warning(
+                "I seguenti CUP non risultano nel dataset ANAC (potrebbero riguardare "
+                "affidamenti non ordinari, essere di recente emissione o non ancora "
+                "propagati nel dataset open data): " + ", ".join(cup_non_trovati)
+            )
 else:
     st.info("Incolla uno o più CUP, oppure carica un file Excel, per iniziare.")
 
