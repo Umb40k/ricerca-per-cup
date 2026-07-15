@@ -17,6 +17,7 @@ Avvio:
 import io
 import time
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -49,10 +50,11 @@ DATASET_CONFIG = {
     },
 }
 
-RICHIESTA_TIMEOUT = 30
+RICHIESTA_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 180
-PAUSA_TRA_RICHIESTE = 0.5
-MAX_TENTATIVI = 5
+PAUSA_TRA_RICHIESTE = 0.0
+MAX_TENTATIVI = 3
+MAX_WORKER_THREADS = 10  # chiamate all'API getSmartCig in parallelo
 
 # Il portale open data ANAC filtra le richieste prive di intestazioni "da browser":
 # senza uno User-Agent realistico alcune richieste vengono rifiutate (pagina di errore
@@ -299,13 +301,13 @@ def interroga_cig(cig: str) -> dict:
             resp = requests.get(url, headers=HEADERS_BROWSER, timeout=RICHIESTA_TIMEOUT)
             if resp.status_code >= 500:
                 ultimo_errore = f"{resp.status_code} Server Error"
-                time.sleep(min(2 ** tentativo, 20) + random.uniform(0, 1))
+                time.sleep(min(2 ** tentativo, 6) + random.uniform(0, 0.5))
                 continue
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             ultimo_errore = e
-            time.sleep(min(2 ** tentativo, 20) + random.uniform(0, 1))
+            time.sleep(min(2 ** tentativo, 6) + random.uniform(0, 0.5))
     return {"errore": str(ultimo_errore)}
 
 
@@ -529,24 +531,33 @@ if cup_list:
 
                 barra_avanzamento = st.progress(0, text="Recupero dettagli CIG in corso...")
                 placeholder_tabella = st.empty()
-                risultati = []
 
                 righe = corrispondenze.to_dict("records")
-                for i, riga_match in enumerate(righe, start=1):
-                    cup = riga_match["CUP"]
-                    cig = riga_match["CIG"]
-                    risposta = interroga_cig(cig)
-                    risultati.append(estrai_dati(cup, cig, risposta))
+                risultati = [None] * len(righe)
+                completati = 0
 
-                    barra_avanzamento.progress(
-                        i / len(righe),
-                        text=f"CIG {i} di {len(righe)}: {cig} (CUP {cup})",
-                    )
+                with ThreadPoolExecutor(max_workers=min(MAX_WORKER_THREADS, len(righe))) as executor:
+                    future_to_idx = {
+                        executor.submit(interroga_cig, riga_match["CIG"]): idx
+                        for idx, riga_match in enumerate(righe)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        cup = righe[idx]["CUP"]
+                        cig = righe[idx]["CIG"]
+                        risposta = future.result()
+                        risultati[idx] = estrai_dati(cup, cig, risposta)
 
-                    df_parziale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
-                    placeholder_tabella.dataframe(df_parziale, use_container_width=True, height=350)
+                        completati += 1
+                        barra_avanzamento.progress(
+                            completati / len(righe),
+                            text=f"CIG elaborati: {completati} di {len(righe)}",
+                        )
 
-                    time.sleep(PAUSA_TRA_RICHIESTE)
+                        df_parziale = pd.DataFrame(
+                            [r for r in risultati if r is not None], columns=COLONNE_RISULTATO
+                        )
+                        placeholder_tabella.dataframe(df_parziale, use_container_width=True, height=350)
 
                 barra_avanzamento.empty()
                 df_finale = pd.DataFrame(risultati, columns=COLONNE_RISULTATO)
