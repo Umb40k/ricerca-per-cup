@@ -619,6 +619,25 @@ def ottieni_dataset_filtrato_con_fallback(
     return st.session_state.get(chiave_df)
 
 
+def genera_template_excel_cup() -> bytes:
+    """Genera un file Excel vuoto con la sola intestazione 'CUP', da usare
+    come modello per il caricamento."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "LISTA CUP"
+    cell = ws.cell(row=1, column=1, value="CUP")
+    cell.font = Font(bold=True, color="FFFFFF")
+    cell.fill = PatternFill(start_color="0B3D62", end_color="0B3D62", fill_type="solid")
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions["A"].width = 24
+    # righe di esempio, facoltative, cancellabili dall'utente
+    ws.cell(row=2, column=1, value="F16H21000000008")
+    ws.cell(row=3, column=1, value="F55G21000000001")
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
 # --------------------------------------------------------------------------
 # Interfaccia
 # --------------------------------------------------------------------------
@@ -640,7 +659,19 @@ with col_input:
             cup_list = [c.strip() for c in testo_cup.splitlines() if c.strip()]
 
     with tab_file:
-        file_caricato = st.file_uploader("File Excel con una colonna CUP", type=["xlsx"])
+        col_uploader, col_template = st.columns([3, 1])
+        with col_uploader:
+            file_caricato = st.file_uploader("File Excel con una colonna CUP", type=["xlsx"])
+        with col_template:
+            st.write("")
+            st.write("")
+            st.download_button(
+                label="Scarica template",
+                data=genera_template_excel_cup(),
+                file_name="template_lista_cup.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
         if file_caricato is not None:
             try:
                 wb_up = openpyxl.load_workbook(file_caricato, data_only=True)
