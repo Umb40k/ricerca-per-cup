@@ -569,26 +569,29 @@ def ottieni_dataset_con_fallback(nome_dataset: str, obbligatorio: bool = True):
     return st.session_state.get(chiave_df)
 
 
-def ottieni_dataset_filtrato_con_fallback(
-    nome_dataset: str, valori_da_cercare: list, pattern_colonna: str, obbligatorio: bool = False
+def _chiave_dataset_filtrato(nome_dataset: str, valori_da_cercare: list) -> str:
+    return f"df_filtrato_{nome_dataset}_{hash(tuple(sorted(valori_da_cercare)))}"
+
+
+def _recupera_dataset_filtrato(nome_dataset: str, valori_da_cercare: list, pattern_colonna: str):
+    """Funzione 'pura' (nessuna chiamata Streamlit): scarica e filtra il
+    dataset a blocchi. Pensata per essere eseguita anche in un thread
+    separato, così più dataset possono essere recuperati in parallelo."""
+    try:
+        df = scarica_e_filtra_dataset_a_blocchi(nome_dataset, valori_da_cercare, pattern_colonna)
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+
+def mostra_dataset_filtrato_con_fallback(
+    nome_dataset: str, valori_da_cercare: list, obbligatorio: bool = False
 ):
-    """Come ottieni_dataset_con_fallback, ma per i dataset di grandi
-    dimensioni: scarica e filtra a blocchi (senza mai caricare tutto il
-    file in memoria) e mette in cache solo il risultato già filtrato,
-    molto più leggero."""
-    chiave_df = f"df_filtrato_{nome_dataset}_{hash(tuple(sorted(valori_da_cercare)))}"
+    """Mostra l'esito già recuperato (da session_state) per un dataset
+    filtrato, con eventuale UI di caricamento manuale in caso di errore."""
+    chiave_df = _chiave_dataset_filtrato(nome_dataset, valori_da_cercare)
     chiave_errore = f"errore_{nome_dataset}"
     titolo = DATASET_CONFIG[nome_dataset]["titolo"]
-
-    if chiave_df not in st.session_state:
-        try:
-            st.session_state[chiave_df] = scarica_e_filtra_dataset_a_blocchi(
-                nome_dataset, valori_da_cercare, pattern_colonna
-            )
-            st.session_state[chiave_errore] = None
-        except Exception as e:
-            st.session_state[chiave_df] = None
-            st.session_state[chiave_errore] = str(e)
 
     if st.session_state.get(chiave_errore):
         livello = st.error if obbligatorio else st.warning
@@ -781,13 +784,31 @@ if cup_list:
                 st.dataframe(df_finale, use_container_width=True, height=400)
 
                 # ------------------------------------------------------------
-                # Quadro economico
+                # Quadro economico e Stati di avanzamento (SAL) — in parallelo
                 # ------------------------------------------------------------
+                chiave_qe = _chiave_dataset_filtrato("quadro-economico", lista_cig_trovati)
+                chiave_sal = _chiave_dataset_filtrato("stati-avanzamento", lista_cig_trovati)
+
+                with st.spinner("Recupero quadro economico e stati di avanzamento in parallelo..."):
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        future_qe = executor.submit(
+                            _recupera_dataset_filtrato, "quadro-economico", lista_cig_trovati, "CIG"
+                        )
+                        future_sal = executor.submit(
+                            _recupera_dataset_filtrato, "stati-avanzamento", lista_cig_trovati, "CIG"
+                        )
+                        df_qe, errore_qe = future_qe.result()
+                        df_sal, errore_sal = future_sal.result()
+
+                st.session_state[chiave_qe] = df_qe
+                st.session_state["errore_quadro-economico"] = errore_qe
+                st.session_state[chiave_sal] = df_sal
+                st.session_state["errore_stati-avanzamento"] = errore_sal
+
                 st.markdown("### Quadro economico")
-                with st.spinner("Recupero le voci di quadro economico per i CIG trovati..."):
-                    df_qe_filtrato = ottieni_dataset_filtrato_con_fallback(
-                        "quadro-economico", lista_cig_trovati, "CIG", obbligatorio=False
-                    )
+                df_qe_filtrato = mostra_dataset_filtrato_con_fallback(
+                    "quadro-economico", lista_cig_trovati, obbligatorio=False
+                )
                 if df_qe_filtrato is None:
                     df_qe_filtrato = pd.DataFrame()
                 elif df_qe_filtrato.empty:
@@ -795,14 +816,10 @@ if cup_list:
                 else:
                     st.dataframe(df_qe_filtrato, use_container_width=True, height=300)
 
-                # ------------------------------------------------------------
-                # Stati di avanzamento lavori (SAL)
-                # ------------------------------------------------------------
                 st.markdown("### Stati di avanzamento lavori (SAL)")
-                with st.spinner("Recupero gli stati di avanzamento per i CIG trovati..."):
-                    df_sal_filtrato = ottieni_dataset_filtrato_con_fallback(
-                        "stati-avanzamento", lista_cig_trovati, "CIG", obbligatorio=False
-                    )
+                df_sal_filtrato = mostra_dataset_filtrato_con_fallback(
+                    "stati-avanzamento", lista_cig_trovati, obbligatorio=False
+                )
                 if df_sal_filtrato is None:
                     df_sal_filtrato = pd.DataFrame()
                 elif df_sal_filtrato.empty:
