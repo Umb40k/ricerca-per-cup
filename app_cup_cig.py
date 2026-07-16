@@ -210,38 +210,57 @@ def risolvi_url_dataset(nome_dataset: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def scarica_dataset_anac(nome_dataset: str) -> pd.DataFrame:
-    """Scarica e carica in memoria un dataset ANAC (cup, quadro-economico,
-    stati-avanzamento, ...). Gestisce sia file CSV diretti sia archivi
-    ZIP contenenti il CSV."""
+    """Scarica e carica in memoria un dataset ANAC (pensata per dataset
+    contenuti come 'cup'). Scarica in streaming su disco per non raddoppiare
+    l'uso di RAM, poi lo carica in un unico DataFrame."""
     import zipfile
+    import tempfile
+    import os
 
     url = risolvi_url_dataset(nome_dataset)
     resp = requests.get(url, headers=HEADERS_BROWSER, timeout=DOWNLOAD_TIMEOUT, stream=True)
     resp.raise_for_status()
-    contenuto = resp.content
 
-    if not contenuto:
-        raise RuntimeError("Il portale ANAC ha restituito una risposta vuota.")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
+    try:
+        with os.fdopen(tmp_fd, "wb") as tmp_file:
+            for blocco in resp.iter_content(chunk_size=1024 * 1024):
+                if blocco:
+                    tmp_file.write(blocco)
 
-    # Se è uno ZIP, estraggo il primo file CSV al suo interno
-    if zipfile.is_zipfile(io.BytesIO(contenuto)):
-        with zipfile.ZipFile(io.BytesIO(contenuto)) as zf:
-            nomi_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-            if not nomi_csv:
-                raise RuntimeError(f"Nessun file CSV trovato nello ZIP scaricato. Contenuto: {zf.namelist()}")
-            with zf.open(nomi_csv[0]) as f_csv:
-                df = pd.read_csv(f_csv, dtype=str, sep=None, engine="python")
-    else:
-        anteprima = contenuto[:100].lstrip()
-        if anteprima[:1] in (b"<", b"{"):
-            testo_anteprima = contenuto[:300].decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"Il portale ANAC ha restituito una pagina di errore invece del file. Anteprima: {testo_anteprima}"
-            )
-        df = pd.read_csv(io.BytesIO(contenuto), dtype=str, sep=None, engine="python")
+        if os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("Il portale ANAC ha restituito una risposta vuota.")
 
-    df.columns = [c.strip().upper() for c in df.columns]
-    return df
+        if zipfile.is_zipfile(tmp_path):
+            with zipfile.ZipFile(tmp_path) as zf:
+                nomi_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not nomi_csv:
+                    raise RuntimeError(f"Nessun file CSV trovato nello ZIP scaricato. Contenuto: {zf.namelist()}")
+                with zf.open(nomi_csv[0]) as f_csv:
+                    prima_riga = f_csv.readline().decode("utf-8", errors="replace")
+                with zf.open(nomi_csv[0]) as f_csv:
+                    separatore = _rileva_separatore(prima_riga)
+                    df = pd.read_csv(f_csv, dtype=str, sep=separatore, low_memory=False)
+        else:
+            with open(tmp_path, "rb") as f_peek:
+                testa = f_peek.read(200).lstrip()
+            if testa[:1] in (b"<", b"{"):
+                testo_anteprima = testa.decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Il portale ANAC ha restituito una pagina di errore invece del file. Anteprima: {testo_anteprima}"
+                )
+            with open(tmp_path, "r", encoding="utf-8", errors="replace") as f_peek2:
+                prima_riga = f_peek2.readline()
+            separatore = _rileva_separatore(prima_riga)
+            df = pd.read_csv(tmp_path, dtype=str, sep=separatore, low_memory=False)
+
+        df.columns = [c.strip().upper() for c in df.columns]
+        return df
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def leggi_dataset_da_file_caricato(contenuto: bytes) -> pd.DataFrame:
@@ -257,6 +276,106 @@ def leggi_dataset_da_file_caricato(contenuto: bytes) -> pd.DataFrame:
         df = pd.read_csv(io.BytesIO(contenuto), dtype=str, sep=None, engine="python")
     df.columns = [c.strip().upper() for c in df.columns]
     return df
+
+
+def _rileva_separatore(prima_riga: str) -> str:
+    """Individua il separatore CSV (ANAC usa spesso ';') senza affidarsi
+    al motore 'python' di pandas su file di grandi dimensioni, che è lento."""
+    import csv as _csv
+    try:
+        return _csv.Sniffer().sniff(prima_riga, delimiters=";,\t|").delimiter
+    except Exception:
+        return ";" if prima_riga.count(";") >= prima_riga.count(",") else ","
+
+
+def scarica_e_filtra_dataset_a_blocchi(
+    nome_dataset: str, valori_da_cercare: list, pattern_colonna: str
+) -> pd.DataFrame:
+    """Scarica un dataset ANAC (potenzialmente molto grande) in streaming su
+    disco e lo filtra leggendolo a blocchi (chunk), senza mai caricarlo
+    interamente in memoria. Evita i crash per esaurimento RAM che si
+    verificano con i dataset più pesanti (es. quadro-economico,
+    stati-avanzamento)."""
+    import zipfile
+    import tempfile
+    import os
+
+    url = risolvi_url_dataset(nome_dataset)
+    resp = requests.get(url, headers=HEADERS_BROWSER, timeout=DOWNLOAD_TIMEOUT, stream=True)
+    resp.raise_for_status()
+
+    valori_set = set(str(v).strip().upper() for v in valori_da_cercare)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bin")
+    try:
+        with os.fdopen(tmp_fd, "wb") as tmp_file:
+            for blocco in resp.iter_content(chunk_size=1024 * 1024):
+                if blocco:
+                    tmp_file.write(blocco)
+
+        if os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("Il portale ANAC ha restituito una risposta vuota.")
+
+        def _apri_csv_sorgente():
+            """Restituisce (file_object_testuale, prima_riga) del CSV, gestendo lo ZIP."""
+            if zipfile.is_zipfile(tmp_path):
+                zf = zipfile.ZipFile(tmp_path)
+                nomi_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not nomi_csv:
+                    raise RuntimeError(f"Nessun file CSV nello ZIP di '{nome_dataset}'.")
+                f = zf.open(nomi_csv[0])
+                prima_riga_bytes = f.readline()
+                f.close()
+                f = zf.open(nomi_csv[0])
+                return f, prima_riga_bytes.decode("utf-8", errors="replace")
+            else:
+                with open(tmp_path, "rb") as f_peek:
+                    testa = f_peek.read(200).lstrip()
+                if testa[:1] in (b"<", b"{"):
+                    testo_anteprima = testa.decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"Il portale ANAC ha restituito una pagina di errore invece del file. Anteprima: {testo_anteprima}"
+                    )
+                f = open(tmp_path, "rb")
+                prima_riga_bytes = f.readline()
+                f.seek(0)
+                return f, prima_riga_bytes.decode("utf-8", errors="replace")
+
+        f_sorgente, prima_riga = _apri_csv_sorgente()
+        separatore = _rileva_separatore(prima_riga)
+
+        pezzi_trovati = []
+        colonna_chiave = None
+        try:
+            for chunk_df in pd.read_csv(
+                f_sorgente, dtype=str, sep=separatore, chunksize=50_000, low_memory=False
+            ):
+                chunk_df.columns = [c.strip().upper() for c in chunk_df.columns]
+                if colonna_chiave is None:
+                    colonna_chiave = next(
+                        (c for c in chunk_df.columns if c == pattern_colonna or pattern_colonna in c),
+                        None,
+                    )
+                    if colonna_chiave is None:
+                        raise RuntimeError(
+                            f"Colonna '{pattern_colonna}' non trovata nel dataset '{nome_dataset}'. "
+                            f"Colonne disponibili: {list(chunk_df.columns)}"
+                        )
+                match = chunk_df[chunk_df[colonna_chiave].astype(str).str.strip().str.upper().isin(valori_set)]
+                if not match.empty:
+                    pezzi_trovati.append(match.copy())
+        finally:
+            f_sorgente.close()
+
+        if pezzi_trovati:
+            return pd.concat(pezzi_trovati, ignore_index=True)
+        return pd.DataFrame()
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def trova_cig_per_cup(df_cup: pd.DataFrame, cup_list: list) -> pd.DataFrame:
@@ -450,6 +569,56 @@ def ottieni_dataset_con_fallback(nome_dataset: str, obbligatorio: bool = True):
     return st.session_state.get(chiave_df)
 
 
+def ottieni_dataset_filtrato_con_fallback(
+    nome_dataset: str, valori_da_cercare: list, pattern_colonna: str, obbligatorio: bool = False
+):
+    """Come ottieni_dataset_con_fallback, ma per i dataset di grandi
+    dimensioni: scarica e filtra a blocchi (senza mai caricare tutto il
+    file in memoria) e mette in cache solo il risultato già filtrato,
+    molto più leggero."""
+    chiave_df = f"df_filtrato_{nome_dataset}_{hash(tuple(sorted(valori_da_cercare)))}"
+    chiave_errore = f"errore_{nome_dataset}"
+    titolo = DATASET_CONFIG[nome_dataset]["titolo"]
+
+    if chiave_df not in st.session_state:
+        try:
+            st.session_state[chiave_df] = scarica_e_filtra_dataset_a_blocchi(
+                nome_dataset, valori_da_cercare, pattern_colonna
+            )
+            st.session_state[chiave_errore] = None
+        except Exception as e:
+            st.session_state[chiave_df] = None
+            st.session_state[chiave_errore] = str(e)
+
+    if st.session_state.get(chiave_errore):
+        livello = st.error if obbligatorio else st.warning
+        livello(
+            f"Impossibile recuperare il dataset ANAC '{titolo}': "
+            f"{st.session_state[chiave_errore]}"
+        )
+        st.markdown(
+            f"🔗 [Apri il dataset '{nome_dataset}' su dati.anticorruzione.it]"
+            f"(https://dati.anticorruzione.it/opendata/dataset/{nome_dataset}) "
+            "— scaricalo e ricaricalo qui sotto per proseguire."
+        )
+        file_manuale = st.file_uploader(
+            f"Carica il file '{titolo}' (CSV o ZIP)",
+            type=["csv", "zip"],
+            key=f"upload_filtrato_{nome_dataset}",
+        )
+        if file_manuale is not None:
+            try:
+                df_completo_manuale = leggi_dataset_da_file_caricato(file_manuale.read())
+                st.session_state[chiave_df] = filtra_per_cig(df_completo_manuale, valori_da_cercare)
+                st.session_state[chiave_errore] = None
+                st.success("File caricato correttamente.")
+                st.rerun()
+            except Exception as e2:
+                st.error(f"Impossibile leggere il file caricato: {e2}")
+
+    return st.session_state.get(chiave_df)
+
+
 # --------------------------------------------------------------------------
 # Interfaccia
 # --------------------------------------------------------------------------
@@ -584,35 +753,31 @@ if cup_list:
                 # Quadro economico
                 # ------------------------------------------------------------
                 st.markdown("### Quadro economico")
-                with st.spinner("Recupero il dataset 'quadro economico' di ANAC..."):
-                    df_qe_completo = ottieni_dataset_con_fallback("quadro-economico", obbligatorio=False)
-                df_qe_filtrato = pd.DataFrame()
-                if df_qe_completo is not None:
-                    try:
-                        df_qe_filtrato = filtra_per_cig(df_qe_completo, lista_cig_trovati)
-                        if df_qe_filtrato.empty:
-                            st.caption("Nessuna voce di quadro economico trovata per i CIG individuati.")
-                        else:
-                            st.dataframe(df_qe_filtrato, use_container_width=True, height=300)
-                    except Exception as e:
-                        st.warning(f"Impossibile filtrare i dati del quadro economico: {e}")
+                with st.spinner("Recupero le voci di quadro economico per i CIG trovati..."):
+                    df_qe_filtrato = ottieni_dataset_filtrato_con_fallback(
+                        "quadro-economico", lista_cig_trovati, "CIG", obbligatorio=False
+                    )
+                if df_qe_filtrato is None:
+                    df_qe_filtrato = pd.DataFrame()
+                elif df_qe_filtrato.empty:
+                    st.caption("Nessuna voce di quadro economico trovata per i CIG individuati.")
+                else:
+                    st.dataframe(df_qe_filtrato, use_container_width=True, height=300)
 
                 # ------------------------------------------------------------
                 # Stati di avanzamento lavori (SAL)
                 # ------------------------------------------------------------
                 st.markdown("### Stati di avanzamento lavori (SAL)")
-                with st.spinner("Recupero il dataset 'stati di avanzamento' di ANAC..."):
-                    df_sal_completo = ottieni_dataset_con_fallback("stati-avanzamento", obbligatorio=False)
-                df_sal_filtrato = pd.DataFrame()
-                if df_sal_completo is not None:
-                    try:
-                        df_sal_filtrato = filtra_per_cig(df_sal_completo, lista_cig_trovati)
-                        if df_sal_filtrato.empty:
-                            st.caption("Nessuno stato di avanzamento lavori trovato per i CIG individuati.")
-                        else:
-                            st.dataframe(df_sal_filtrato, use_container_width=True, height=300)
-                    except Exception as e:
-                        st.warning(f"Impossibile filtrare i dati degli stati di avanzamento: {e}")
+                with st.spinner("Recupero gli stati di avanzamento per i CIG trovati..."):
+                    df_sal_filtrato = ottieni_dataset_filtrato_con_fallback(
+                        "stati-avanzamento", lista_cig_trovati, "CIG", obbligatorio=False
+                    )
+                if df_sal_filtrato is None:
+                    df_sal_filtrato = pd.DataFrame()
+                elif df_sal_filtrato.empty:
+                    st.caption("Nessuno stato di avanzamento lavori trovato per i CIG individuati.")
+                else:
+                    st.dataframe(df_sal_filtrato, use_container_width=True, height=300)
 
                 # ------------------------------------------------------------
                 # Download
